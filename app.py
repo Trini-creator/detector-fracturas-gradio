@@ -2,15 +2,15 @@
 """
 App Gradio para clasificar imágenes con un modelo Keras/TensorFlow y visualizar Grad-CAM.
 
-Cómo usar en Hugging Face Spaces:
+Instrucciones (Hugging Face Spaces):
 1) Sube este archivo como app.py
-2) Sube tu modelo como 'mi_modelo.h5' (o carpeta SavedModel llamada 'mi_modelo')
-3) Ajusta 'NOMBRES_CLASES' al orden real de tu modelo
-4) (Opcional) Cambia 'MODEL_PATH' si usas otro nombre
+2) Sube tu modelo como:
+   - archivo: fracture_detection_model.h5  o  fracture_detection_model.keras
+   - o carpeta SavedModel: fracture_detection_model/ (con saved_model.pb)
+3) Ajusta CLASS_NAMES al orden real de tu modelo (o define la variable de entorno CLASS_NAMES)
 """
 
 import os
-import io
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -18,142 +18,213 @@ import numpy as np
 from PIL import Image
 
 import tensorflow as tf
-from tensorflow.keras.models import load_model
 from tensorflow.keras import Model
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
 import gradio as gr
 
 # --------------------------------------------------------------------
-# 1) Configuración básica
+# Configuración
 # --------------------------------------------------------------------
+# Nombre base del modelo (sin extensión). Probamos .h5, .keras o carpeta.
+MODEL_BASE = os.getenv("MODEL_PATH", "fracture_detection_model")
+# Etiquetas (por defecto de ejemplo). Puedes definir en el Space: CLASS_NAMES="Fractura,No fractura"
+CLASS_NAMES = os.getenv("CLASS_NAMES", "Gato,Perro,Pájaro").split(",")
 
-# Ruta del modelo. Acepta:
-#  - archivo .h5      -> 'mi_modelo.h5'
-#  - carpeta SavedModel-> 'mi_modelo' (directorio con saved_model.pb)
-MODEL_PATH = "mi_modelo.h5"  # cámbialo si tu modelo tiene otro nombre
-
-# ¡IMPORTANTE! Reemplaza por las etiquetas reales y en el orden correcto
-# Deben coincidir con el vector de salida de tu modelo.
-NOMBRES_CLASES = ["Gato", "Perro", "Pájaro"]  # ejemplo
-
-# Gestión de memoria GPU en Spaces (seguro aunque no haya GPU)
+# Gestión segura de GPU (si existe)
 try:
     gpus = tf.config.list_physical_devices("GPU")
-    for gpu in gpus:
-        tf.config.experimental.set_memory_growth(gpu, True)
+    for g in gpus:
+        tf.config.experimental.set_memory_growth(g, True)
 except Exception:
     pass
 
 # --------------------------------------------------------------------
-# 2) Cargar modelo
+# Carga del modelo (acepta .h5 / .keras / SavedModel/)
 # --------------------------------------------------------------------
-def _load_any_model(path: str):
-    """
-    Carga un modelo Keras desde .h5 o SavedModel.
-    """
-    if not os.path.exists(path):
-        # intento como carpeta SavedModel
-        if os.path.isdir("mi_modelo"):
-            return tf.keras.models.load_model("mi_modelo")
-        raise FileNotFoundError(
-            f"No se encontró '{path}'. Sube tu modelo como 'mi_modelo.h5' "
-            "o una carpeta SavedModel llamada 'mi_modelo'."
-        )
-    # .h5
-    return tf.keras.models.load_model(path)
+def _load_model_any(base: str) -> tf.keras.Model:
+    # Intenta formatos comunes: archivo exacto, variantes, o carpeta SavedModel
+    candidates = [
+        base,                      # si te pasan ya "fracture_detection_model.h5"
+        base + ".h5",
+        base + ".keras",
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return tf.keras.models.load_model(path)
+    # Carpeta SavedModel
+    if os.path.isdir(base):
+        return tf.keras.models.load_model(base)
+    raise FileNotFoundError(
+        f"No se encontró el modelo '{base}'. Sube 'fracture_detection_model.h5', "
+        f"'fracture_detection_model.keras' o la carpeta 'fracture_detection_model/'."
+    )
 
 try:
-    modelo = _load_any_model(MODEL_PATH)
-    # Comprobación del número de clases vs etiquetas
-    salida = modelo.output_shape
-    # salida puede ser (None, C) o lista si hay múltiples salidas
-    if isinstance(salida, (list, tuple)) and isinstance(salida[0], (list, tuple)):
-        num_clases = salida[0][-1]
-    else:
-        num_clases = salida[-1]
-    if len(NOMBRES_CLASES) != num_clases:
-        print(f"[AVISO] El modelo tiene {num_clases} clases pero NOMBRES_CLASES tiene {len(NOMBRES_CLASES)}. "
-              f"Ajusta NOMBRES_CLASES para evitar etiquetas erróneas.")
-    print("✅ Modelo cargado correctamente.")
+    model = _load_model_any(MODEL_BASE)
+    print("✅ Modelo cargado.")
+except TypeError as e:
+    # Error típico por incompatibilidad Keras3 vs Keras2 (batch_shape, etc.)
+    raise SystemExit(
+        "Error al cargar el modelo (posible incompatibilidad de versiones). "
+        "En tu 'requirements.txt' usa por ejemplo:\n"
+        "tensorflow==2.15.0\nkeras==2.15.0\n"
+        "o guarda tu modelo en formato Keras 3 (.keras)."
+    ) from e
 except Exception as e:
-    raise RuntimeError(f"Error al cargar el modelo: {e}")
+    raise SystemExit(f"Error al cargar el modelo: {e}")
 
-# Detectar tamaño de entrada (H, W). Si no es 3 canales, se adaptará a RGB.
-def _infer_input_size(keras_model) -> tuple:
+# --------------------------------------------------------------------
+# Inferir tamaño de entrada (H, W, C)
+# --------------------------------------------------------------------
+def _infer_input_size(keras_model) -> tuple[int, int, int]:
     ishape = keras_model.input_shape
-    # Ejemplos:
-    # (None, 224, 224, 3) -> NHWC
-    # (None, 3, 224, 224) -> NCHW (poco común en TF)
-    if isinstance(ishape, list):
+    if isinstance(ishape, (list, tuple)) and isinstance(ishape[0], (list, tuple)):
         ishape = ishape[0]
     if len(ishape) == 4:
+        # NHWC habitual
         if ishape[3] in (1, 3):
-            return (ishape[1], ishape[2])  # H, W
-        elif ishape[1] in (1, 3):
-            return (ishape[2], ishape[3])  # asumiendo NCHW
-    # fallback
-    return (224, 224)
+            return int(ishape[1] or 224), int(ishape[2] or 224), int(ishape[3])
+        # NCHW (raro en TF)
+        if ishape[1] in (1, 3):
+            return int(ishape[2] or 224), int(ishape[3] or 224), int(ishape[1])
+    return 224, 224, 3
 
-TARGET_SIZE = _infer_input_size(modelo)
+IN_H, IN_W, IN_C = _infer_input_size(model)
+
+# Validar número de clases vs CLASS_NAMES
+try:
+    out_shape = model.output_shape
+    if isinstance(out_shape, (list, tuple)) and isinstance(out_shape[0], (list, tuple)):
+        num_classes = int(out_shape[0][-1])
+    else:
+        num_classes = int(out_shape[-1])
+except Exception:
+    num_classes = len(CLASS_NAMES)
+
+if len(CLASS_NAMES) != num_classes:
+    print(f"[AVISO] El modelo tiene {num_classes} clases, pero CLASS_NAMES tiene {len(CLASS_NAMES)}. "
+          f"Ajusta CLASS_NAMES para etiquetar correctamente.")
 
 # --------------------------------------------------------------------
-# 3) Utilidades: preprocesado y Grad-CAM
+# Utilidades: preprocesado y Grad-CAM
 # --------------------------------------------------------------------
-def _to_rgb(pil_img: Image.Image) -> Image.Image:
-    if pil_img.mode != "RGB":
-        return pil_img.convert("RGB")
-    return pil_img
+def _ensure_rgb(pil_img: Image.Image) -> Image.Image:
+    return pil_img.convert("RGB") if pil_img.mode != "RGB" else pil_img
 
 def _preprocess(pil_img: Image.Image) -> np.ndarray:
-    """
-    Preprocesado estándar (reescala 0-1). Ajusta aquí si usaste otra normalización.
-    """
-    img = _to_rgb(pil_img).resize(TARGET_SIZE, Image.BILINEAR)
-    arr = np.array(img).astype("float32") / 255.0
-    arr = np.expand_dims(arr, axis=0)  # (1,H,W,3)
+    # Normalización simple a [0,1]. Ajusta si usaste otra (e.g., tf.keras.applications.*.preprocess_input).
+    img = _ensure_rgb(pil_img).resize((IN_W, IN_H), Image.BILINEAR)
+    arr = np.asarray(img).astype("float32") / 255.0
+    if arr.ndim == 2:  # gris -> (H,W,1)
+        arr = np.expand_dims(arr, -1)
+    if arr.shape[-1] == 1:  # fuerza 3 canales si el modelo lo espera
+        arr = np.repeat(arr, 3, axis=-1)
+    arr = np.expand_dims(arr, 0)  # (1,H,W,3)
     return arr
 
-def _pick_last_conv_layer(keras_model: tf.keras.Model):
-    """
-    Intenta localizar la última capa convolucional 2D válida para Grad-CAM.
-    """
+def _find_last_conv_layer(keras_model: tf.keras.Model):
+    # Busca la última capa con salida 4D (N,H,W,C)
     for layer in reversed(keras_model.layers):
-        lname = layer.__class__.__name__.lower()
-        if "conv" in lname and "separable" not in lname and hasattr(layer, "output_shape"):
-            # capa conv 2D típica
-            try:
-                # verificar que el output es 4D (N,H,W,C)
-                if len(layer.output_shape) == 4:
-                    return layer.name
-            except Exception:
-                continue
-        # también soportar SeparableConv2D
-        if "separableconv2d" in lname and hasattr(layer, "output_shape"):
-            try:
-                if len(layer.output_shape) == 4:
-                    return layer.name
-            except Exception:
-                continue
-    # si no encuentra, devolver None
+        try:
+            oshape = layer.output_shape
+            if isinstance(oshape, tuple) and len(oshape) == 4:
+                return layer
+        except Exception:
+            continue
     return None
 
-LAST_CONV_NAME = _pick_last_conv_layer(modelo)
+LAST_CONV = _find_last_conv_layer(model)
 
-def _gradcam(pil_img: Image.Image, class_index: int = None, alpha: float = 0.35):
-    """
-    Calcula Grad-CAM y devuelve (overlay_pil, heatmap_pil, predicted_label, dict_probs)
-    """
-    if LAST_CONV_NAME is None:
-        raise RuntimeError("No se pudo localizar una capa convolucional para Grad‑CAM.")
+def _make_gradcam(pil_img: Image.Image, class_index: int | None = None, alpha: float = 0.40):
+    if LAST_CONV is None:
+        raise RuntimeError("No se encontró una capa convolucional adecuada para Grad‑CAM.")
 
-    # Prepara tensores
-    img_rgb = _to_rgb(pil_img)
-    orig_w, orig_h = img_rgb.size
-    x = _preprocess(img_rgb)
+    x = _preprocess(pil_img)
+    preds = model.predict(x, verbose=0)[0]
+    if class_index is None:
+        class_index = int(np.argmax(preds))
 
-    # Predicción para obtener clase objetivo si no se especifica
-    preds = modelo.predict(x, verbose=0)
+    # Confianzas con etiquetas
+    labels = CLASS_NAMES if len(CLASS_NAMES) == preds.shape[-1] else [f"Clase {i}" for i in range(preds.shape[-1])]
+    conf = {labels[i]: float(preds[i]) for i in range(len(labels))}
+    top_label = labels[class_index]
+
+    # Modelo intermedio para obtener activaciones + salida final
+    grad_model = Model(inputs=model.inputs, outputs=[LAST_CONV.output, model.output])
+
+    with tf.GradientTape() as tape:
+        conv_out, probs = grad_model(x, training=False)
+        if probs.shape.rank == 2:
+            target = probs[:, class_index]
+        else:
+            target = tf.reshape(probs, (tf.shape(probs)[0], -1))[:, class_index]
+
+    grads = tape.gradient(target, conv_out)                  # (1, Hc, Wc, C)
+    pooled_grads = tf.reduce_mean(grads, axis=(1, 2))        # (1, C)
+    conv_out = conv_out[0]                                   # (Hc, Wc, C)
+    pooled_grads = pooled_grads[0]                           # (C,)
+
+    cam = tf.reduce_sum(conv_out * pooled_grads, axis=-1)    # (Hc, Wc)
+    cam = tf.nn.relu(cam)
+    cam = cam / (tf.reduce_max(cam) + 1e-8)
+    cam = tf.image.resize(cam[..., tf.newaxis], (pil_img.height, pil_img.width))
+    cam = tf.squeeze(cam, -1).numpy()                        # (H, W)
+
+    # Crear heatmap con matplotlib
+    import matplotlib.pyplot as plt
+    colormap = plt.get_cmap("jet")
+    heat = (colormap(cam)[:, :, :3] * 255).astype(np.uint8)  # RGB uint8
+
+    base = _ensure_rgb(pil_img)
+    overlay = (0.40 * heat + 0.60 * np.asarray(base)).astype(np.uint8)
+
+    heat_pil = Image.fromarray(heat)
+    overlay_pil = Image.fromarray(overlay)
+
+    return overlay_pil, heat_pil, top_label, conf
+
+# --------------------------------------------------------------------
+# Función de Gradio
+# --------------------------------------------------------------------
+def predict_and_gradcam(pil_image: Image.Image):
+    if pil_image is None:
+        return {}, None, None
+    try:
+        overlay, heat, top, conf = _make_gradcam(pil_image, class_index=None, alpha=0.40)
+        return conf, overlay, heat
+    except Exception as e:
+        # Si Grad-CAM falla, al menos devolver predicción
+        x = _preprocess(pil_image)
+        preds = model.predict(x, verbose=0)[0]
+        labels = CLASS_NAMES if len(CLASS_NAMES) == preds.shape[-1] else [f"Clase {i}" for i in range(preds.shape[-1])]
+        conf = {labels[i]: float(preds[i]) for i in range(len(labels))}
+        print(f"⚠️ Grad‑CAM no disponible: {e}")
+        return conf, pil_image, pil_image
+
+# --------------------------------------------------------------------
+# Interfaz Gradio
+# --------------------------------------------------------------------
+DESCRIPTION = """
+Sube una imagen: el modelo la clasifica y muestra **Grad‑CAM** con las zonas que más influyeron.
+**Importante**: ajusta `CLASS_NAMES` (variables de entorno del Space) al orden real de tu modelo.
+"""
+
+with gr.Blocks(title="Clasificador + Grad‑CAM (Keras/TF)") as demo:
+    gr.Markdown("# Clasificador de Imágenes + Grad‑CAM (Keras/TF)")
+    gr.Markdown(DESCRIPTION)
+
+    with gr.Row():
+        with gr.Column():
+            inp = gr.Image(type="pil", label="Imagen de entrada")
+            btn = gr.Button("Predecir", variant="primary")
+        with gr.Column():
+            out_label = gr.Label(num_top_classes=3, label="Predicciones")
+            out_overlay = gr.Image(type="pil", label="Grad‑CAM (superpuesta)")
+            out_heat = gr.Image(type="pil", label="Heatmap")
+
+    btn.click(fn=predict_and_gradcam, inputs=inp, outputs=[out_label, out_overlay, out_heat])
+
+# Para Spaces (usa el puerto del entorno)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 7860))
+    demo.queue(concurrency_count=2).launch(server_name="0.0.0.0", server_port=port)
+
