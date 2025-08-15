@@ -16,7 +16,7 @@ import numpy as np
 # 2. Cargar tu modelo de Keras/TensorFlow
 # Asegúrate de que el archivo 'mi_modelo.h5' esté en la misma carpeta
 try:
-    modelo = tf.keras.models.load_model('mi_modelo.h5')
+    modelo = tf.keras.models.load_model('fracture_detection_model.h5')
     print("Modelo cargado correctamente.")
 except Exception as e:
     print(f"Error al cargar el modelo: {e}")
