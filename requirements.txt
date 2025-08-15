@@ -1,3 +1,7 @@
-tensorflow
-gradio
+tensorflow==2.15.0
+keras==2.15.0
+gradio>=4.36.0,<5
 numpy
+pillow
+matplotlib
+
